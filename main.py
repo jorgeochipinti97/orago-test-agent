@@ -18,7 +18,7 @@ app = FastAPI(title="Orago Test Agent")
 _bedrock: Any = None
 
 MODEL_ID = os.getenv(
-    "BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0"
+    "BEDROCK_MODEL_ID", "mistral.ministral-3-8b-instruct"
 )
 MAX_TOKENS = int(os.getenv("BEDROCK_MAX_TOKENS", "1024"))
 
@@ -74,7 +74,7 @@ class ChatResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _build_system_prompt(context: str | None) -> str:
-    base = "You are a helpful AI assistant deployed on Orago."
+    base = "You are a helpful AI assistant deployed on Orago. Respond in the same language as the user."
     if context:
         return f"{base}\n\nRelevant context:\n{context}"
     return base
@@ -83,20 +83,17 @@ def _build_system_prompt(context: str | None) -> str:
 def _invoke_bedrock(
     messages: list[dict],
     system: str,
-    tools: list[dict] | None = None,
-) -> dict:
-    """Call Bedrock converse API and return the raw response body."""
+) -> str:
+    """Call Bedrock with Mistral-compatible format and return text response."""
     client = _get_bedrock()
 
-    body: dict[str, Any] = {
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": MAX_TOKENS,
-        "system": system,
-        "messages": messages,
-    }
+    # Prepend system message
+    all_messages = [{"role": "system", "content": system}] + messages
 
-    if tools:
-        body["tools"] = tools
+    body: dict[str, Any] = {
+        "messages": all_messages,
+        "max_tokens": MAX_TOKENS,
+    }
 
     response = client.invoke_model(
         modelId=MODEL_ID,
@@ -105,22 +102,13 @@ def _invoke_bedrock(
         body=json.dumps(body),
     )
 
-    return json.loads(response["body"].read())
+    result = json.loads(response["body"].read())
 
-
-def _extract_tool_calls(content: list[dict]) -> list[ToolCall]:
-    """Pull tool_use blocks out of a Claude response."""
-    return [
-        ToolCall(id=block["id"], name=block["name"], input=block["input"])
-        for block in content
-        if block.get("type") == "tool_use"
-    ]
-
-
-def _extract_text(content: list[dict]) -> str:
-    """Concatenate text blocks from a Claude response."""
-    parts = [block["text"] for block in content if block.get("type") == "text"]
-    return "\n".join(parts)
+    # Mistral format: {"choices": [{"message": {"content": "..."}}]}
+    choices = result.get("choices", [])
+    if choices:
+        return choices[0].get("message", {}).get("content", "")
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -132,61 +120,42 @@ async def chat(req: ChatRequest) -> ChatResponse:
     conv_id = req.conversation_id or str(uuid.uuid4())
     history = conversations.setdefault(conv_id, [])
 
-    # ---- If the orchestrator sent tool_results, append them first ----------
-    if req.tool_results:
-        tool_result_content = [
-            {
-                "type": "tool_result",
-                "tool_use_id": tr.tool_use_id,
-                "content": tr.content,
-            }
-            for tr in req.tool_results
-        ]
-        history.append({"role": "user", "content": tool_result_content})
-
-    # ---- Append the new user message (skip empty ones on tool-result turns) -
+    # ---- Append the new user message -----------------------------------------
     if req.message.strip():
         history.append({
             "role": "user",
-            "content": [{"type": "text", "text": req.message}],
+            "content": req.message,
+        })
+
+    # ---- If we got tool results, append them as assistant context ------------
+    if req.tool_results:
+        tool_info = "\n".join(
+            f"Tool result ({tr.tool_use_id}): {tr.content}"
+            for tr in req.tool_results
+        )
+        history.append({
+            "role": "user",
+            "content": f"Here are the tool results:\n{tool_info}",
         })
 
     # ---- Call Bedrock -------------------------------------------------------
     system = _build_system_prompt(req.context)
 
     try:
-        result = _invoke_bedrock(
+        text = _invoke_bedrock(
             messages=history,
             system=system,
-            tools=req.tools,
         )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Bedrock error: {exc}")
 
-    assistant_content: list[dict] = result.get("content", [])
-
     # Save assistant turn in history
-    history.append({"role": "assistant", "content": assistant_content})
-
-    # ---- Tool use? Return tool_calls to the orchestrator --------------------
-    tool_calls = _extract_tool_calls(assistant_content)
-    if tool_calls:
-        return ChatResponse(
-            conversation_id=conv_id,
-            tool_calls=tool_calls,
-        )
-
-    # ---- Normal text response -----------------------------------------------
-    text = _extract_text(assistant_content)
-
-    # If stop_reason indicates the model gave up, signal handoff
-    stop_reason = result.get("stop_reason", "")
-    handoff = stop_reason == "end_turn" and not text.strip()
+    history.append({"role": "assistant", "content": text})
 
     return ChatResponse(
         response=text or "I'm not sure how to help with that.",
         conversation_id=conv_id,
-        handoff=handoff,
+        handoff=False,
     )
 
 
